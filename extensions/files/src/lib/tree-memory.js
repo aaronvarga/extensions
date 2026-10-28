@@ -11,25 +11,25 @@ export async function load_tree_memory() {
   const root = await worktree_root();
   try {
     const raw = localStorage.getItem(storage_key(root));
-    if (!raw) return { expanded: [], selected: null };
+    if (!raw) return { expanded: [], selected: null, collapsed: false };
     const parsed = JSON.parse(raw);
     const expanded = Array.isArray(parsed?.expanded)
       ? parsed.expanded.filter((p) => typeof p === "string")
       : [];
     const selected = typeof parsed?.selected === "string" ? parsed.selected : null;
-    return { expanded, selected };
+    return { expanded, selected, collapsed: parsed?.collapsed === true };
   } catch {
-    return { expanded: [], selected: null };
+    return { expanded: [], selected: null, collapsed: false };
   }
 }
 
-export async function save_tree_memory(expandedDirs, selected) {
+export async function save_tree_memory(expandedDirs, selected, collapsed = false) {
   const root = await worktree_root();
   const expanded = Array.from(expandedDirs).slice(-MAX_EXPANDED);
   try {
     localStorage.setItem(
       storage_key(root),
-      JSON.stringify({ expanded, selected: selected ?? null }),
+      JSON.stringify({ expanded, selected: selected ?? null, collapsed }),
     );
   } catch {
   }

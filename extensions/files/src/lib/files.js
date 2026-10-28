@@ -19,7 +19,52 @@ function path_segments(path) {
     .filter(Boolean);
 }
 
-export function same_file(changedPath, filePath) {
+// Extra project folders are addressed by their absolute path; the main folder is
+// always `null`, so tabs and drafts saved before multi-root keep their identity.
+export function normalize_root(root) {
+  return typeof root === "string" && root ? strip_slash(root) || null : null;
+}
+
+// Option bag for muxy.files.* calls; empty means the main folder. An object
+// rather than undefined/null so a serialized bridge never sees `null` options.
+export function root_opts(root) {
+  const r = normalize_root(root);
+  return r ? { root: r } : {};
+}
+
+// exec cwd for an extra folder; empty keeps the host default (main folder).
+export function exec_opts(root) {
+  const r = normalize_root(root);
+  return r ? { cwd: r } : {};
+}
+
+export function file_key(root, filePath) {
+  const r = normalize_root(root);
+  const rel = strip_slash(String(filePath ?? ""));
+  return r ? `${r}\0${rel}` : rel;
+}
+
+export function editor_tab_data(rel, root) {
+  const r = normalize_root(root);
+  return r ? { filePath: rel, root: r, replaceable: false } : { filePath: rel, replaceable: false };
+}
+
+// `file.changed` payload `root` equals `projectPath` for main-folder changes.
+export function change_root(payload) {
+  const root = normalize_root(payload?.root);
+  return root && root !== normalize_root(payload?.projectPath) ? root : null;
+}
+
+export function same_file(payload, filePath, root = null) {
+  const changed = payload && typeof payload === "object" ? payload.path : undefined;
+  if (typeof changed !== "string") return false;
+  const want = normalize_root(root);
+  if (change_root(payload) !== want) return false;
+  if (want) return strip_slash(changed) === `${want}/${strip_slash(String(filePath ?? ""))}`;
+  return same_suffix(changed, filePath);
+}
+
+function same_suffix(changedPath, filePath) {
   const want = path_segments(filePath);
   if (want.length === 0) return false;
   const got = path_segments(changedPath);
@@ -114,15 +159,14 @@ export async function try_action(action, error_title) {
   }
 }
 
-export async function open_in_editor(rel, focusTabId = null) {
+async function open_editor_tab(rel, root) {
   try {
-    if (focusTabId && (await focus_tab(focusTabId))) return;
     await muxy.tabs.open({
       kind: "extensionWebView",
       extension: {
         id: muxy.extensionID,
         tabType: "code-editor",
-        data: { filePath: rel, replaceable: false },
+        data: editor_tab_data(rel, root),
       },
     });
   } catch (err) {
@@ -132,46 +176,38 @@ export async function open_in_editor(rel, focusTabId = null) {
   }
 }
 
-export async function open_in_new_tab(rel) {
-  try {
-    await muxy.tabs.open({
-      kind: "extensionWebView",
-      extension: {
-        id: muxy.extensionID,
-        tabType: "code-editor",
-        data: { filePath: rel, replaceable: false },
-      },
-    });
-  } catch (err) {
-    await muxy
-      .toast({ title: "Open file", body: error_message(err), variant: "error" })
-      .catch(() => undefined);
-  }
+export async function open_in_editor(rel, root = null, focusTabId = null) {
+  if (focusTabId && (await focus_tab(focusTabId))) return;
+  await open_editor_tab(rel, root);
 }
 
-export async function is_internal_file(rel) {
+export async function open_in_new_tab(rel, root = null) {
+  await open_editor_tab(rel, root);
+}
+
+export async function is_internal_file(rel, root = null) {
   const path = strip_slash(rel);
   if (!path) return false;
   try {
-    const stat = await muxy.files.stat(path);
+    const stat = await muxy.files.stat(path, root_opts(root));
     return Boolean(stat) && !stat.isDirectory;
   } catch {
     return false;
   }
 }
 
-export async function reveal_in_finder(rel) {
-  await muxy.exec(["open", "-R", strip_slash(rel)]).catch(() => undefined);
+export async function reveal_in_finder(rel, root = null) {
+  await muxy.exec(["open", "-R", strip_slash(rel)], exec_opts(root)).catch(() => undefined);
 }
 
-export async function reveal_paths(rels) {
+export async function reveal_paths(rels, root = null) {
   const paths = rels.map((rel) => strip_slash(rel));
   if (paths.length === 0) return;
-  await muxy.exec(["open", "-R", ...paths]).catch(() => undefined);
+  await muxy.exec(["open", "-R", ...paths], exec_opts(root)).catch(() => undefined);
 }
 
-export async function open_externally(rel) {
-  await muxy.exec(["open", strip_slash(rel)]).catch(() => undefined);
+export async function open_externally(rel, root = null) {
+  await muxy.exec(["open", strip_slash(rel)], exec_opts(root)).catch(() => undefined);
 }
 
 export async function open_url(url) {

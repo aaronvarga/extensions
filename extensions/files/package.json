@@ -1,6 +1,6 @@
 {
   "name": "files",
-  "version": "1.21.6",
+  "version": "1.22.0",
   "scripts": {
     "dev": "vite",
     "build": "vite build && node scripts/copy-build-assets.mjs",
@@ -71,7 +71,8 @@
       "tabs:write",
       "commands:exec",
       "commands:run-script",
-      "git:read"
+      "git:read",
+      "projects:read"
     ],
     "events": [
       "file.changed",
@@ -81,7 +82,8 @@
       "tab.updated",
       "tab.closed",
       "tab.focused",
-      "panel.opened"
+      "panel.opened",
+      "projects.changed"
     ],
     "panels": [
       {

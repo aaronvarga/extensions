@@ -263,9 +263,10 @@ function render_markdown(parent, source, isDark, ctx) {
 const TOC_MIN_HEADINGS = 2;
 
 export class MarkdownView {
-  constructor({ source, fontSize, isDark, filePath, showToc = false, onToggleTask = null }) {
+  constructor({ source, fontSize, isDark, filePath, root = null, showToc = false, onToggleTask = null }) {
     ensure_preview_highlight_css();
     this.filePath = filePath;
+    this.fileRoot = root;
     this.showToc = showToc;
     this.onToggleTask = onToggleTask;
     this.headings = [];
@@ -364,8 +365,8 @@ export class MarkdownView {
   }
 
   async openLinkTarget(target, hash) {
-    if (await is_internal_file(target)) {
-      void open_in_new_tab(target);
+    if (await is_internal_file(target, this.fileRoot)) {
+      void open_in_new_tab(target, this.fileRoot);
       return;
     }
     void open_url(hash ? `${target}#${hash}` : target);

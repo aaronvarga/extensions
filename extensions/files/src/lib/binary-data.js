@@ -1,10 +1,10 @@
-import { strip_slash } from "@/lib/files";
+import { normalize_root, strip_slash } from "@/lib/files";
 import { worktree_root } from "@/lib/worktree-root";
 
-export async function read_binary_base64(filePath, kind = "file") {
+export async function read_binary_base64(filePath, kind = "file", root = null) {
   const rel = strip_slash(filePath);
   if (!rel) throw new Error("No file path");
-  const cwd = await worktree_root();
+  const cwd = normalize_root(root) ?? (await worktree_root());
   const res = await muxy.exec(["base64", "-i", rel], { cwd });
   if (res.exitCode !== 0) {
     throw new Error(res.stderr?.trim() || `Could not read ${kind}`);
@@ -14,8 +14,8 @@ export async function read_binary_base64(filePath, kind = "file") {
   return base64;
 }
 
-export async function read_binary_bytes(filePath, kind = "file") {
-  const base64 = await read_binary_base64(filePath, kind);
+export async function read_binary_bytes(filePath, kind = "file", root = null) {
+  const base64 = await read_binary_base64(filePath, kind, root);
   const decoded = atob(base64);
   const bytes = new Uint8Array(decoded.length);
   for (let index = 0; index < decoded.length; index += 1) {

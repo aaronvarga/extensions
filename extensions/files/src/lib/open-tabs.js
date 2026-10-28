@@ -1,3 +1,6 @@
+// Relative import keeps this module loadable by `node --test`.
+import { file_key, normalize_root } from "./files.js";
+
 const TAB_TYPE = "code-editor";
 
 function tab_id_of(entry) {
@@ -13,7 +16,7 @@ function is_editor_entry(entry) {
   return extId === muxy.extensionID && type === TAB_TYPE;
 }
 
-function file_path_of(entry) {
+function file_of(entry) {
   let data = entry?.data ?? entry?.extension?.data;
   if (typeof data === "string") {
     try {
@@ -23,7 +26,8 @@ function file_path_of(entry) {
     }
   }
   const filePath = data && typeof data === "object" ? data.filePath : null;
-  return typeof filePath === "string" && filePath ? filePath : null;
+  if (typeof filePath !== "string" || !filePath) return null;
+  return { filePath, root: normalize_root(data.root) };
 }
 
 function is_active_entry(entry) {
@@ -66,13 +70,13 @@ export class OpenTabsStore {
     this.byTab.clear();
     for (const entry of tabs) {
       if (!is_editor_entry(entry)) continue;
-      this.set(file_path_of(entry), tab_id_of(entry));
+      this.set(file_of(entry), tab_id_of(entry));
     }
   }
 
   track(payload) {
     if (!is_editor_entry(payload)) return;
-    this.set(file_path_of(payload), tab_id_of(payload));
+    this.set(file_of(payload), tab_id_of(payload));
   }
 
   untrack(payload) {
@@ -80,44 +84,48 @@ export class OpenTabsStore {
     if (tabId) this.removeByTab(tabId);
   }
 
-  set(filePath, tabId) {
-    if (!filePath || !tabId) return;
-    const prevPath = this.byTab.get(tabId);
-    if (prevPath && prevPath !== filePath) this.byPath.delete(prevPath);
-    const prevTab = this.byPath.get(filePath);
+  // Tabs are keyed by root + relative path so the same path in two folders
+  // never resolves to the other folder's tab.
+  set(file, tabId) {
+    if (!file || !tabId) return;
+    const key = file_key(file.root, file.filePath);
+    const prev = this.byTab.get(tabId);
+    if (prev && prev.key !== key) this.byPath.delete(prev.key);
+    const prevTab = this.byPath.get(key);
     if (prevTab && prevTab !== tabId) this.byTab.delete(prevTab);
-    this.byPath.set(filePath, tabId);
-    this.byTab.set(tabId, filePath);
+    this.byPath.set(key, tabId);
+    this.byTab.set(tabId, { key, filePath: file.filePath, root: file.root });
   }
 
   removeByTab(tabId) {
-    const filePath = this.byTab.get(tabId);
+    const file = this.byTab.get(tabId);
     this.byTab.delete(tabId);
-    if (filePath && this.byPath.get(filePath) === tabId) this.byPath.delete(filePath);
+    if (file && this.byPath.get(file.key) === tabId) this.byPath.delete(file.key);
   }
 
-  tabIdFor(filePath) {
-    return this.byPath.get(filePath) ?? null;
+  tabIdFor(filePath, root = null) {
+    return this.byPath.get(file_key(root, filePath)) ?? null;
   }
 
-  filePathFor(tabId) {
-    return this.byTab.get(tabId) ?? null;
+  fileFor(tabId) {
+    const file = this.byTab.get(tabId);
+    return file ? { filePath: file.filePath, root: file.root } : null;
   }
 
-  async resolveTabId(filePath) {
+  async resolveTabId(filePath, root = null) {
     await this.seed();
-    return this.tabIdFor(filePath);
+    return this.tabIdFor(filePath, root);
   }
 
-  async resolveFilePath(tabId) {
+  async resolveFile(tabId) {
     if (!tabId) return null;
-    const known = this.filePathFor(tabId);
+    const known = this.fileFor(tabId);
     if (known) return known;
     await this.seed();
-    return this.filePathFor(tabId);
+    return this.fileFor(tabId);
   }
 
-  async activeFilePath() {
+  async activeFile() {
     let tabs;
     try {
       tabs = await muxy.tabs.list();
@@ -127,7 +135,7 @@ export class OpenTabsStore {
     if (!Array.isArray(tabs)) return null;
     for (const entry of tabs) {
       if (!is_editor_entry(entry) || !is_active_entry(entry)) continue;
-      return file_path_of(entry);
+      return file_of(entry);
     }
     return null;
   }

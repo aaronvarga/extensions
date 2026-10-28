@@ -1,5 +1,6 @@
-import { strip_slash } from "@/lib/files";
-import { worktree_root } from "@/lib/worktree-root";
+// Relative imports keep this module loadable by `node --test`.
+import { file_key, strip_slash } from "./files.js";
+import { worktree_root } from "./worktree-root.js";
 
 const STORAGE_PREFIX = "muxy.files.draft:";
 const MAX_ENTRIES = 50;
@@ -9,9 +10,12 @@ function storage_key(root) {
   return `${STORAGE_PREFIX}${root || ""}`;
 }
 
-function draft_key(filePath) {
-  const rel = strip_slash(filePath).trim();
-  return rel || null;
+// Main-folder keys stay the bare relative path, so drafts saved before
+// multi-root still restore for the main folder.
+// `folder` is an extra project folder (null = main folder).
+function draft_key(filePath, folder) {
+  const rel = strip_slash(String(filePath ?? "")).trim();
+  return rel ? file_key(folder, rel) : null;
 }
 
 function read_registry(root) {
@@ -42,16 +46,16 @@ function prune(registry) {
   return registry;
 }
 
-export async function read_draft(filePath) {
-  const rel = draft_key(filePath);
+export async function read_draft(filePath, folder = null) {
+  const rel = draft_key(filePath, folder);
   if (!rel) return null;
   const record = read_registry(await worktree_root())[rel];
   if (!record || typeof record.content !== "string" || typeof record.baseline !== "string") return null;
   return { content: record.content, baseline: record.baseline };
 }
 
-export async function write_draft(filePath, content, baseline) {
-  const rel = draft_key(filePath);
+export async function write_draft(filePath, content, baseline, folder = null) {
+  const rel = draft_key(filePath, folder);
   if (!rel || typeof content !== "string" || typeof baseline !== "string") return;
   if (content.length > MAX_DRAFT_BYTES) return;
   const root = await worktree_root();
@@ -60,8 +64,8 @@ export async function write_draft(filePath, content, baseline) {
   write_registry(root, prune(registry));
 }
 
-export async function clear_draft(filePath) {
-  const rel = draft_key(filePath);
+export async function clear_draft(filePath, folder = null) {
+  const rel = draft_key(filePath, folder);
   if (!rel) return;
   const root = await worktree_root();
   const registry = read_registry(root);

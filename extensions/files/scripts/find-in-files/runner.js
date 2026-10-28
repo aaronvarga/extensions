@@ -12,12 +12,14 @@ const COMMAND_NOT_FOUND_EXIT_CODE = 127;
 // git grep exits 128 outside a Git work tree and 129 when it is too old for an option.
 const GIT_GREP_UNAVAILABLE_EXIT_CODES = [COMMAND_NOT_FOUND_EXIT_CODE, 128, 129];
 const SEARCH_CACHE_LIMIT = 20;
+// Extra project folders are searched at most this many at a time.
+const ROOT_CONCURRENCY = 2;
 
 let searchCache = new Map();
 let searchSerial = 0;
 let searchTimer = null;
 let searchTimerResolve = null;
-let currentExecHandle = null;
+let currentExecHandles = new Set();
 
 export function open_find_in_files() {
   muxy.modal.open({
@@ -41,7 +43,8 @@ function handle_query(query, emitOrOptions, maybeOptions) {
     return [];
   }
 
-  const cacheKey = search_key(variants, options);
+  const roots = search_roots();
+  const cacheKey = search_key(variants, options, roots);
   const cachedItems = cached_items(cacheKey);
   if (cachedItems) {
     if (emit) return schedule_cached_emit(cachedItems, emit);
@@ -49,15 +52,32 @@ function handle_query(query, emitOrOptions, maybeOptions) {
     return [];
   }
 
-  if (emit) return schedule_search({ cacheKey, variants, options, emit });
+  if (emit) return schedule_search({ cacheKey, variants, options, roots, emit });
   cancel_scheduled_search();
   return [];
 }
 
+// `null` is the main folder; extra folders come from the active project.
+// runScript calls are synchronous, and a host without folders yields [null].
+function search_roots() {
+  try {
+    const projects = muxy.projects?.list?.();
+    const active = Array.isArray(projects) ? projects.find((p) => p && p.isActive) : null;
+    const folders = active && Array.isArray(active.folders) ? active.folders : [];
+    const extra = folders
+      .filter((f) => typeof f === "string" && f)
+      .map((f) => f.replace(/\/+$/, ""))
+      .filter(Boolean);
+    return [null, ...new Set(extra)];
+  } catch {
+    return [null];
+  }
+}
+
 function cancel_running_search() {
-  const handle = currentExecHandle;
-  currentExecHandle = null;
-  if (handle) {
+  const handles = Array.from(currentExecHandles);
+  currentExecHandles.clear();
+  for (const handle of handles) {
     try {
       handle.cancel();
     } catch (_) {
@@ -88,7 +108,7 @@ function schedule_search(search) {
         done();
         return;
       }
-      perform_search(search.variants, search.options)
+      perform_search(search.variants, search.options, search.roots, serial)
         .then((result) => {
           if (serial !== searchSerial) return;
           if (result.cacheable) {
@@ -172,23 +192,58 @@ function resolve_scheduled_search(expectedResolve) {
   resolve();
 }
 
-async function perform_search(variants, options) {
-  let response = await run_request(rg_request(variants, options));
+async function perform_search(variants, options, roots, serial) {
+  let collected = 0;
+  const outcomes = await map_limit(roots, ROOT_CONCURRENCY, async (root) => {
+    // Don't launch a folder once superseded or once earlier folders filled the list.
+    if (serial !== searchSerial || collected >= MAX_RESULTS) return null;
+    const response = await search_root(variants, options, root, serial);
+    const items = response.ok ? result_items(response.result, root) : [];
+    collected += items.length;
+    return { response, items };
+  });
+  const done = outcomes.filter(Boolean);
+
+  // Folders that failed are dropped; the rest still show, uncached.
+  const items = done.flatMap((outcome) => outcome.items).slice(0, MAX_RESULTS);
+  if (items.length > 0) {
+    const cacheable = done.every((outcome) => outcome.response.ok && is_cacheable_result(outcome.response.result));
+    return { items, cacheable };
+  }
+  const failures = done.filter(
+    (outcome) => !(outcome.response.ok && is_empty_success_result(outcome.response.result)),
+  );
+  if (failures.length === 0) return { items: [], cacheable: done.length > 0 };
+  if (failures.length < done.length) return { items: [], cacheable: false };
+  return failure_result(failures[0].response, variants, options);
+}
+
+async function map_limit(values, limit, fn) {
+  const out = new Array(values.length);
+  let next = 0;
+  const worker = async () => {
+    while (next < values.length) {
+      const index = next++;
+      out[index] = await fn(values[index]);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
+  return out;
+}
+
+async function search_root(variants, options, root, serial) {
+  let response = await run_request(rg_request(variants, options), root, serial);
   if (is_unavailable(response, [COMMAND_NOT_FOUND_EXIT_CODE])) {
-    response = await run_request(git_grep_request(variants, options));
+    response = await run_request(git_grep_request(variants, options), root, serial);
     if (is_unavailable(response, GIT_GREP_UNAVAILABLE_EXIT_CODES)) {
-      response = await run_request(grep_request(variants, options));
+      response = await run_request(grep_request(variants, options), root, serial);
     }
   }
+  return response;
+}
 
+function failure_result(response, variants, options) {
   const result = response.ok ? response.result : null;
-  const items = result_items(result);
-  if (items.length > 0) {
-    return { items, cacheable: is_cacheable_result(result) };
-  }
-  if (response.ok && is_empty_success_result(result)) {
-    return { items: [], cacheable: true };
-  }
   if (is_cancelled_response(response)) {
     return { items: [], cacheable: false };
   }
@@ -201,11 +256,12 @@ async function perform_search(variants, options) {
   return search_error("Search failed", variants[0]);
 }
 
-async function run_request(request) {
-  const handle = muxy.execAsync(request.argv, {
-    stdin: request.stdin,
-    timeoutMs: request.timeoutMs,
-  });
+async function run_request(request, root, serial) {
+  // A superseded search must not launch its next fallback command.
+  if (serial !== searchSerial) return { ok: false, error: { cancelled: true } };
+  const execOptions = { stdin: request.stdin, timeoutMs: request.timeoutMs };
+  if (root) execOptions.cwd = root;
+  const handle = muxy.execAsync(request.argv, execOptions);
   if (
     !handle ||
     typeof handle.cancel !== "function" ||
@@ -214,14 +270,7 @@ async function run_request(request) {
     return { ok: false, error: new Error("muxy.execAsync unavailable") };
   }
 
-  if (currentExecHandle) {
-    try {
-      currentExecHandle.cancel();
-    } catch (_) {
-      // ignore — best-effort cancel of a previously running exec
-    }
-  }
-  currentExecHandle = handle;
+  currentExecHandles.add(handle);
 
   try {
     const result = await handle.result;
@@ -229,7 +278,7 @@ async function run_request(request) {
   } catch (error) {
     return { ok: false, error };
   } finally {
-    if (currentExecHandle === handle) currentExecHandle = null;
+    currentExecHandles.delete(handle);
   }
 }
 
@@ -240,7 +289,7 @@ function is_unavailable(response, exitCodes) {
   return is_command_not_found_error(response.error);
 }
 
-function result_items(result) {
+function result_items(result, root) {
   if (!result) return [];
   const seen = new Set();
   const items = [];
@@ -249,7 +298,7 @@ function result_items(result) {
   while (start < stdout.length && items.length < MAX_RESULTS) {
     const newline = stdout.indexOf("\n", start);
     const line = newline === -1 ? stdout.slice(start) : stdout.slice(start, newline);
-    const item = parse_result_line(line);
+    const item = parse_result_line(line, root);
     if (item && !seen.has(item.id)) {
       seen.add(item.id);
       items.push(item);
@@ -324,12 +373,13 @@ export function reset_find_in_files_state_for_tests() {
   cancel_scheduled_search();
 }
 
-function search_key(variants, options) {
+function search_key(variants, options, roots) {
   return JSON.stringify({
     caseSensitive: options.caseSensitive,
     wholeWord: options.wholeWord,
     regex: options.regex,
     variants,
+    roots,
   });
 }
 
@@ -365,11 +415,9 @@ function open_result(choice) {
       id: extId,
       tabType: "code-editor",
       singleton: false,
-      data: {
-        filePath: result.filePath,
-        line: result.lineNumber,
-        replaceable: false,
-      },
+      data: result.root
+        ? { filePath: result.filePath, root: result.root, line: result.lineNumber, replaceable: false }
+        : { filePath: result.filePath, line: result.lineNumber, replaceable: false },
     },
   });
 }

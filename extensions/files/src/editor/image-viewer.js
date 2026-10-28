@@ -1,12 +1,13 @@
 import { read_image_data_url } from "@/lib/image-data";
-import { error_message } from "@/lib/files";
+import { error_message, root_opts } from "@/lib/files";
 import { format_file_size } from "@/lib/file-size";
 import { h } from "@/lib/dom";
 
 export class ImageViewer {
-  constructor({ parent, filePath, svgSource = null }) {
+  constructor({ parent, filePath, root = null, svgSource = null }) {
     this.parent = parent;
     this.filePath = filePath;
+    this.fileRoot = root;
     this.svgSource = svgSource;
     this.actualSize = false;
     this.disposed = false;
@@ -29,7 +30,7 @@ export class ImageViewer {
       dataUrl = `data:image/svg+xml;utf8,${encodeURIComponent(this.svgSource)}`;
     } else {
       try {
-        dataUrl = await read_image_data_url(this.filePath);
+        dataUrl = await read_image_data_url(this.filePath, this.fileRoot);
       } catch (err) {
         if (this.disposed) return;
         this.stage.replaceChildren(
@@ -85,7 +86,7 @@ export class ImageViewer {
 
   async addFileSize(slot) {
     try {
-      const stat = await muxy.files.stat(this.filePath);
+      const stat = await muxy.files.stat(this.filePath, root_opts(this.fileRoot));
       if (this.disposed) return;
       const label = format_file_size(stat?.size);
       if (label) slot.textContent = label;

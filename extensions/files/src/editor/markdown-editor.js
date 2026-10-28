@@ -2,9 +2,10 @@ import { CodeEditor } from "@/editor/code-editor";
 import { MarkdownView } from "@/editor/markdown-view";
 
 export class MarkdownEditor {
-  constructor({ parent, filePath, value, isDark, config, mode, initialPosition, showToc, onDirty, onSave, onToggleTask }) {
+  constructor({ parent, filePath, root = null, value, isDark, config, mode, initialPosition, showToc, onDirty, onSave, onToggleTask }) {
     this.parent = parent;
     this.filePath = filePath;
+    this.fileRoot = root;
     this.source = value;
     this.isDark = isDark;
     this.config = config;
@@ -26,6 +27,7 @@ export class MarkdownEditor {
         fontSize: this.config.fontSize,
         isDark: this.isDark,
         filePath: this.filePath,
+        root: this.fileRoot,
         showToc: this.showToc,
         onToggleTask: (next) => {
           this.source = next;
@@ -38,6 +40,7 @@ export class MarkdownEditor {
     this.child = new CodeEditor({
       parent: this.parent,
       filePath: this.filePath,
+      root: this.fileRoot,
       value: this.source,
       isDark: this.isDark,
       config: this.config,

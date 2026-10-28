@@ -3,11 +3,11 @@ let resolved = false;
 
 export async function worktree_root() {
   if (resolved) return cachedRoot;
+  // muxy.exec runs in the active worktree by default, so `pwd` names it
+  // without the worktrees:read permission this extension doesn't have.
   try {
-    const worktrees = await muxy.worktrees.list();
-    const active =
-      worktrees.find((w) => w.isActive) ?? worktrees.find((w) => w.isPrimary) ?? worktrees[0];
-    cachedRoot = active?.path;
+    const res = await muxy.exec(["pwd"]);
+    cachedRoot = res?.exitCode === 0 ? res.stdout.trim() || undefined : undefined;
   } catch {
     cachedRoot = undefined;
   }

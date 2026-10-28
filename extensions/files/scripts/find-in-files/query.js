@@ -5,8 +5,9 @@ import {
   MIN_QUERY_LENGTH,
 } from "./constants.js";
 
-export function result_id(filePath, lineNumber) {
-  return JSON.stringify({ filePath, lineNumber });
+// `root` is the absolute extra folder; main-folder ids omit it.
+export function result_id(filePath, lineNumber, root = null) {
+  return JSON.stringify(root ? { filePath, lineNumber, root } : { filePath, lineNumber });
 }
 
 export function parse_result_id(id) {
@@ -15,24 +16,31 @@ export function parse_result_id(id) {
     if (!parsed || typeof parsed.filePath !== "string") return null;
     const lineNumber = Number(parsed.lineNumber);
     if (!Number.isFinite(lineNumber) || lineNumber < 1) return null;
-    return { filePath: parsed.filePath, lineNumber };
+    const root = typeof parsed.root === "string" && parsed.root ? parsed.root : null;
+    return { filePath: parsed.filePath, lineNumber, root };
   } catch {
     return null;
   }
 }
 
-export function parse_result_line(line) {
+export function parse_result_line(line, root = null) {
   const parsed = split_result_line(line);
   if (!parsed) return null;
 
   const filePath = workspace_path(parsed.filePath);
   if (!filePath) return null;
 
+  const location = `${filePath}:${parsed.lineNumber}`;
   return {
-    id: result_id(filePath, parsed.lineNumber),
+    id: result_id(filePath, parsed.lineNumber, root),
     title: title_for(parsed.content),
-    subtitle: `${filePath}:${parsed.lineNumber}`,
+    subtitle: root ? `${folder_name(root)} • ${location}` : location,
   };
+}
+
+function folder_name(root) {
+  const clean = root.replace(/\/+$/, "");
+  return clean.slice(clean.lastIndexOf("/") + 1) || clean;
 }
 
 export function search_options(raw) {

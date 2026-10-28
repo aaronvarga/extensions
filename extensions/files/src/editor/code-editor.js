@@ -50,7 +50,7 @@ import { read_cursor_state, write_cursor_state } from "@/lib/cursor-state";
 import { gitGutterExtension, setGitBaseline } from "@/editor/git-gutter";
 import { colorSwatchExtension } from "@/editor/color-swatch";
 import { head_baseline } from "@/lib/git-baseline";
-import { same_file } from "@/lib/files";
+import { file_key, same_file } from "@/lib/files";
 
 const replacePanelMode = new WeakMap();
 
@@ -282,9 +282,10 @@ class FindPanel {
 }
 
 export class CodeEditor {
-  constructor({ parent, filePath, value, isDark, config, initialPosition, onDirty, onSave }) {
+  constructor({ parent, filePath, root = null, value, isDark, config, initialPosition, onDirty, onSave }) {
     this.parent = parent;
     this.filePath = filePath;
+    this.fileRoot = root;
     this.value = value;
     this.isDark = isDark;
     this.config = config;
@@ -303,7 +304,7 @@ export class CodeEditor {
     this.parent.replaceChildren(this.container);
 
     const initialSelection = this.selectionFromPosition(value, initialPosition);
-    const saved = initialSelection ? null : read_cursor_state(filePath);
+    const saved = initialSelection ? null : read_cursor_state(file_key(root, filePath));
     const selection =
       initialSelection ??
       (saved && saved.anchor <= value.length && saved.head <= value.length
@@ -358,12 +359,14 @@ export class CodeEditor {
     window.addEventListener("keydown", this.keyHandler, true);
     this.loadLanguage(filePath);
     this.loadLinter();
-    this.loadGitBaseline(filePath);
-    this.gitBaselineDisposer = muxy.events.subscribe("file.changed", (payload) => {
-      const changed = payload && typeof payload === "object" && "path" in payload ? payload.path : undefined;
-      if (typeof changed !== "string" || !same_file(changed, filePath)) return;
+    // Git APIs cover the main folder only; extra folders get no gutter baseline.
+    if (!root) {
       this.loadGitBaseline(filePath);
-    });
+      this.gitBaselineDisposer = muxy.events.subscribe("file.changed", (payload) => {
+        if (!same_file(payload, filePath)) return;
+        this.loadGitBaseline(filePath);
+      });
+    }
   }
 
   selectionFromPosition(value, position) {
@@ -419,7 +422,7 @@ export class CodeEditor {
   saveCursorState() {
     if (!this.view) return;
     const { anchor, head } = this.view.state.selection.main;
-    write_cursor_state(this.filePath, {
+    write_cursor_state(file_key(this.fileRoot, this.filePath), {
       anchor,
       head,
       scrollTop: this.view.scrollDOM.scrollTop,

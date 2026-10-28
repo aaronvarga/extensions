@@ -1,4 +1,15 @@
-import { basename, error_message, open_externally, reveal_in_finder, same_file, try_action } from "@/lib/files";
+import {
+  basename,
+  editor_tab_data,
+  error_message,
+  file_key,
+  normalize_root,
+  open_externally,
+  reveal_in_finder,
+  root_opts,
+  same_file,
+  try_action,
+} from "@/lib/files";
 import { is_html, is_image, is_markdown, is_pdf, is_svg } from "@/lib/languages";
 import { icon_for } from "@/lib/file-icon";
 import { CodeEditor } from "@/editor/code-editor";
@@ -77,13 +88,13 @@ export class EditorApp {
         const nextPath = nextData.filePath;
 
         if (this.dirty && prevPath) {
-          if (nextPath && nextPath !== prevPath) {
+          if (nextPath && file_key(nextData.root, nextPath) !== this.fileKey) {
             void muxy.tabs.open({
               kind: "extensionWebView",
               extension: {
                 id: muxy.extensionID,
                 tabType: "code-editor",
-                data: { filePath: nextPath, replaceable: false },
+                data: editor_tab_data(nextPath, nextData.root),
               },
             });
           }
@@ -197,6 +208,16 @@ export class EditorApp {
     return this.data.filePath;
   }
 
+  // Absolute extra-folder path, or null for the main folder (and for tabs
+  // restored from before multi-root, which carry no root).
+  get fileRoot() {
+    return normalize_root(this.data.root);
+  }
+
+  get fileKey() {
+    return this.filePath ? file_key(this.fileRoot, this.filePath) : null;
+  }
+
   get replaceable() {
     return this.data.replaceable !== false;
   }
@@ -227,6 +248,7 @@ export class EditorApp {
 
   async loadTarget() {
     const filePath = this.filePath;
+    const root = this.fileRoot;
     this.pendingPosition = this.positionFromData();
     this.updateTabChrome();
 
@@ -270,9 +292,9 @@ export class EditorApp {
     }
 
     try {
-      const file = await muxy.files.read(filePath);
+      const file = await muxy.files.read(filePath, root_opts(root));
       if (this.fileLoadId !== loadId) return;
-      const draft = await this.restorableDraft(filePath, file.content);
+      const draft = await this.restorableDraft(filePath, root, file.content);
       if (this.fileLoadId !== loadId) return;
       this.content = draft ? draft.content : file.content;
       this.baseline = draft ? draft.baseline : file.content;
@@ -295,16 +317,16 @@ export class EditorApp {
     }
   }
 
-  async restorableDraft(filePath, diskContent) {
+  async restorableDraft(filePath, root, diskContent) {
     let draft;
     try {
-      draft = await read_draft(filePath);
+      draft = await read_draft(filePath, root);
     } catch {
       return null;
     }
     if (!draft) return null;
     if (draft.content === diskContent) {
-      void clear_draft(filePath);
+      void clear_draft(filePath, root);
       return null;
     }
     return draft;
@@ -313,22 +335,22 @@ export class EditorApp {
   onFileChanged(payload) {
     const filePath = this.filePath;
     if (!filePath) return;
-    const changed = payload && typeof payload === "object" && "path" in payload ? payload.path : undefined;
-    if (typeof changed !== "string" || !same_file(changed, filePath)) return;
+    if (!same_file(payload, filePath, this.fileRoot)) return;
     // Skip while loading or mid-save: those go through loadTarget()/save(),
     // which already sync this.content with the freshest value.
     if (this.loading || this.saving) return;
     // A conflict prompt is open — don't queue another reload behind it.
     if (this.conflictPending) return;
     if (this.reloadTimer) return;
+    const key = this.fileKey;
     this.reloadTimer = window.setTimeout(() => {
       this.reloadTimer = 0;
-      void this.reloadFromDisk(filePath);
+      void this.reloadFromDisk(key);
     }, RELOAD_DEBOUNCE_MS);
   }
 
-  async reloadFromDisk(filePath) {
-    if (this.filePath !== filePath) return;
+  async reloadFromDisk(key) {
+    if (!key || this.fileKey !== key) return;
     if (this.loading || this.saving) return;
     // A conflict prompt for this file is already open — let the user resolve it first.
     if (this.conflictPending) return;
@@ -342,12 +364,12 @@ export class EditorApp {
 
     let next;
     try {
-      const file = await muxy.files.read(filePath);
+      const file = await muxy.files.read(this.filePath, root_opts(this.fileRoot));
       next = file.content;
     } catch {
       return;
     }
-    if (this.filePath !== filePath || this.saving || this.conflictPending) return;
+    if (this.fileKey !== key || this.saving || this.conflictPending) return;
 
     if (next === this.lastWritten) {
       this.content = next;
@@ -366,7 +388,7 @@ export class EditorApp {
     const buffer = this.child?.getValue ? this.child.getValue() : this.content;
     if (next === buffer) return; // Disk matches what the user has — no real conflict.
 
-    void this.promptConflict(filePath, next);
+    void this.promptConflict(key, next);
   }
 
   applyDiskContent(next) {
@@ -379,9 +401,9 @@ export class EditorApp {
     this.render();
   }
 
-  async promptConflict(filePath, diskContent) {
+  async promptConflict(key, diskContent) {
     this.conflictPending = true;
-    const name = basename(filePath);
+    const name = basename(this.filePath);
     let choice;
     try {
       choice = await muxy.dialog.confirm({
@@ -398,7 +420,7 @@ export class EditorApp {
       this.conflictPending = false;
     }
     // The user may have switched files or saved while the dialog was open.
-    if (this.filePath !== filePath || this.saving) return;
+    if (this.fileKey !== key || this.saving) return;
     if (choice === "Reload") this.applyDiskContent(diskContent);
   }
 
@@ -439,12 +461,12 @@ export class EditorApp {
   persistDraft() {
     if (!this.filePath || this.isBinaryViewer() || this.baseline === null) return;
     if (typeof this.child?.getValue !== "function") return;
-    void write_draft(this.filePath, this.child.getValue(), this.baseline);
+    void write_draft(this.filePath, this.child.getValue(), this.baseline, this.fileRoot);
   }
 
-  dropDraft(filePath = this.filePath) {
-    if (!filePath) return;
-    void clear_draft(filePath);
+  dropDraft() {
+    if (!this.filePath) return;
+    void clear_draft(this.filePath, this.fileRoot);
   }
 
   scheduleAutoSave() {
@@ -476,7 +498,7 @@ export class EditorApp {
     const next = this.child.getValue();
     this.saving = true;
     this.updateTopbar();
-    const ok = await try_action(() => muxy.files.write(this.filePath, next), "Save failed");
+    const ok = await try_action(() => muxy.files.write(this.filePath, next, root_opts(this.fileRoot)), "Save failed");
     this.saving = false;
     if (ok) {
       this.content = next;
@@ -528,14 +550,14 @@ export class EditorApp {
     if (this.baseline === null) return false;
     let onDisk;
     try {
-      const file = await muxy.files.read(this.filePath);
+      const file = await muxy.files.read(this.filePath, root_opts(this.fileRoot));
       onDisk = file.content;
     } catch {
       // Can't read disk — nothing safe to restore; allow the close.
       return false;
     }
     if (onDisk === this.baseline) return false; // Disk already holds the original.
-    const ok = await try_action(() => muxy.files.write(this.filePath, this.baseline), "Discard failed");
+    const ok = await try_action(() => muxy.files.write(this.filePath, this.baseline, root_opts(this.fileRoot)), "Discard failed");
     if (ok) {
       this.content = this.baseline;
       this.lastWritten = this.baseline;
@@ -608,10 +630,10 @@ export class EditorApp {
       return;
     }
 
-    if (!this.shell || this.shellFilePath !== filePath) {
+    if (!this.shell || this.shellFilePath !== this.fileKey) {
       this.destroyChild();
       this.destroySettings();
-      this.shellFilePath = filePath;
+      this.shellFilePath = this.fileKey;
       this.bodyKey = null;
       this.topbar = h("div", { class: "topbar" });
       this.body = h("div", { class: "editor-body" });
@@ -773,7 +795,7 @@ export class EditorApp {
           type: "button",
           "aria-label": "Reveal in Finder",
           title: "Reveal in Finder",
-          onClick: () => void reveal_in_finder(this.filePath),
+          onClick: () => void reveal_in_finder(this.filePath, this.fileRoot),
         },
         RevealIcon(),
       ),
@@ -784,7 +806,7 @@ export class EditorApp {
           type: "button",
           "aria-label": "Open externally",
           title: "Open externally",
-          onClick: () => void open_externally(this.filePath),
+          onClick: () => void open_externally(this.filePath, this.fileRoot),
         },
         OpenIcon(),
       ),
@@ -837,12 +859,13 @@ export class EditorApp {
     const htmlPreview = this.isHtml() && this.htmlView;
     const markdown = this.isMarkdown();
     let key;
-    if (image) key = `${this.filePath}:image`;
-    else if (pdf) key = `${this.filePath}:pdf`;
-    else if (svgPreview) key = `${this.filePath}:svg-view`;
-    else if (htmlPreview) key = `${this.filePath}:html-view`;
-    else if (markdown) key = `${this.filePath}:markdown:${this.mdMode}`;
-    else key = `${this.filePath}:code`;
+    const fileKey = this.fileKey;
+    if (image) key = `${fileKey}:image`;
+    else if (pdf) key = `${fileKey}:pdf`;
+    else if (svgPreview) key = `${fileKey}:svg-view`;
+    else if (htmlPreview) key = `${fileKey}:html-view`;
+    else if (markdown) key = `${fileKey}:markdown:${this.mdMode}`;
+    else key = `${fileKey}:code`;
     if (this.bodyKey === key && this.child) {
       this.child.updateConfig?.(this.config, this.isDark);
       return;
@@ -851,17 +874,18 @@ export class EditorApp {
     this.destroyChild();
     this.bodyKey = key;
     if (image) {
-      this.child = new ImageViewer({ parent: this.body, filePath: this.filePath });
+      this.child = new ImageViewer({ parent: this.body, filePath: this.filePath, root: this.fileRoot });
       return;
     }
     if (pdf) {
-      this.child = new PdfViewer({ parent: this.body, filePath: this.filePath });
+      this.child = new PdfViewer({ parent: this.body, filePath: this.filePath, root: this.fileRoot });
       return;
     }
     if (svgPreview) {
       this.child = new ImageViewer({
         parent: this.body,
         filePath: this.filePath,
+        root: this.fileRoot,
         svgSource: this.content,
       });
       return;
@@ -880,6 +904,7 @@ export class EditorApp {
       this.child = new MarkdownEditor({
         parent: this.body,
         filePath: this.filePath,
+        root: this.fileRoot,
         value: this.content,
         isDark: this.isDark,
         config: this.config,
@@ -897,6 +922,7 @@ export class EditorApp {
     this.child = new CodeEditor({
       parent: this.body,
       filePath: this.filePath,
+      root: this.fileRoot,
       value: this.content,
       isDark: this.isDark,
       config: this.config,

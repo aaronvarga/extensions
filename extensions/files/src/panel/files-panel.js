@@ -1,14 +1,17 @@
 import {
   basename,
   canonical_dir,
+  change_root,
   copy_path,
   copy_paths,
   entry_to_rel,
+  normalize_root,
   open_externally,
   open_in_editor,
   parent_dir,
   reveal_in_finder,
   reveal_paths,
+  root_opts,
   strip_slash,
 } from "@/lib/files";
 import {
@@ -24,12 +27,17 @@ import { material_file_icon, material_folder_icon } from "@/lib/material-icon";
 import { FOLDER_PATHS, icon_paths_for } from "@/lib/file-icon";
 import { load_icon_theme, save_icon_theme, subscribe_icon_theme } from "@/lib/icon-theme";
 import { load_tree_memory, save_tree_memory } from "@/lib/tree-memory";
+import { worktree_root } from "@/lib/worktree-root";
 import { publish_pointer_over_panel } from "@/lib/pointer-guard";
 import { reconcile_children } from "@/lib/list-reconcile";
 import { GitStatusStore } from "@/lib/git-status";
 import { OpenTabsStore } from "@/lib/open-tabs";
 
 const RECONCILE_DEBOUNCE_MS = 250;
+// Expand all stops after this many folders, and lists this many at once, so a
+// huge tree can't flood the bridge or the DOM.
+const EXPAND_ALL_LIMIT = 500;
+const EXPAND_ALL_BATCH = 32;
 
 const GIT_STATUS_CLASS = {
   M: "file-tree-git-modified",
@@ -57,6 +65,46 @@ const GIT_STATUS_GLYPH = {
 
 function is_dir(path) {
   return path === "" || path.endsWith("/");
+}
+
+// Tree keys: main-folder nodes keep their bare relative path. Extra-folder nodes
+// get one path-like leading segment, `\0<encoded root>/`, so parent_dir,
+// basename and depth_of keep working and that prefix is the folder's own node.
+function node_key(root, rel) {
+  return root ? `\0${encodeURIComponent(root)}/${rel}` : rel;
+}
+
+function split_key(key) {
+  if (!key.startsWith("\0")) return { root: null, rel: key };
+  const slash = key.indexOf("/");
+  return { root: decodeURIComponent(key.slice(1, slash)), rel: key.slice(slash + 1) };
+}
+
+// The main root ("") or an extra folder's top-level node: never renamed,
+// deleted, duplicated or dragged.
+function is_root_node(key) {
+  return split_key(key).rel === "";
+}
+
+function display_name(key) {
+  const { root, rel } = split_key(key);
+  return rel === "" && root ? basename(root) : basename(key);
+}
+
+function group_by_root(keys) {
+  const groups = new Map();
+  for (const key of keys) {
+    const { root, rel } = split_key(key);
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root).push(rel);
+  }
+  return groups;
+}
+
+// Relative paths are ambiguous across folders, so extra-folder paths copy absolute.
+function copy_text(key) {
+  const { root, rel } = split_key(key);
+  return root ? `${root}/${strip_slash(rel)}` : rel;
 }
 
 // panel.opened payloads aren't strongly documented; accept the common shapes.
@@ -119,6 +167,14 @@ function file_icon(kind, path, theme) {
   return icon_svg(kind === "directory" ? FOLDER_PATHS : icon_paths_for(path));
 }
 
+function toolbar_button(label, paths, onClick) {
+  return h(
+    "button",
+    { class: "file-tree-toolbar-button", type: "button", title: label, "aria-label": label, onClick },
+    icon_svg(paths),
+  );
+}
+
 function path_after_rename(sourcePath, newName, isFolder) {
   const parent = parent_dir(sourcePath);
   return isFolder ? canonical_dir(`${parent}${newName}`) : `${parent}${newName}`;
@@ -141,7 +197,7 @@ function context_menu_actions(item, ops, selection) {
     { label: "New Folder", run: () => void ops.createFolder(createDir) },
   ];
 
-  if (path !== "") {
+  if (!is_root_node(path)) {
     actions.push(
       { label: "Rename", run: () => ops.rename(path) },
       { label: "Duplicate", run: () => void ops.duplicate(path) },
@@ -190,6 +246,11 @@ export class FilesPanelApp {
     this.selectedPaths = new Set();
     this.anchorPath = null;
     this.worktreeRoot = null;
+    // Node keys of the active project's extra folders, in project order.
+    this.extraRoots = [];
+    // The project folder's own root row, which collapses its whole tree.
+    this.mainCollapsed = false;
+    this.mainRow = null;
     this.dropTarget = null;
     this.renameState = null;
     this.activeRenameInput = null;
@@ -221,27 +282,36 @@ export class FilesPanelApp {
       deletePaths: (rels) => this.deletePaths(rels),
       duplicate: (rel) => this.duplicate(rel),
       rename: (rel) => this.startRename(rel),
-      reveal: (rel) => reveal_in_finder(rel),
-      revealPaths: (rels) => reveal_paths(rels),
-      openExternally: (rel) => open_externally(rel),
-      copyPath: (rel) => copy_path(rel),
+      reveal: (key) => reveal_in_finder(split_key(key).rel, split_key(key).root),
+      revealPaths: (keys) =>
+        Promise.all(Array.from(group_by_root(keys), ([root, rels]) => reveal_paths(rels, root))),
+      openExternally: (key) => open_externally(split_key(key).rel, split_key(key).root),
+      copyPath: (key) => copy_path(copy_text(key)),
       copyPaths: (rels) => this.copyPaths(rels),
       openInEditor: (rel) => this.openFile(rel),
       refresh: () => this.loadRoot(),
     };
   }
 
-  async openFile(rel) {
-    const tabId = await this.openTabs.resolveTabId(rel);
-    return open_in_editor(rel, tabId);
+  async openFile(key) {
+    const { root, rel } = split_key(key);
+    const tabId = await this.openTabs.resolveTabId(rel, root);
+    return open_in_editor(rel, root, tabId);
+  }
+
+  // Tree key for an open tab's file, or null when its folder isn't in this tree.
+  keyForFile(file) {
+    if (!file) return null;
+    if (!file.root) return file.filePath;
+    return this.extraRoots.includes(node_key(file.root, "")) ? node_key(file.root, file.filePath) : null;
   }
 
   async revealActiveTab(payload) {
     const tabId = focused_tab_id_of(payload);
     if (!tabId) return;
-    const rel = await this.openTabs.resolveFilePath(tabId);
-    if (!rel) return;
-    await this.revealFile(rel);
+    const key = this.keyForFile(await this.openTabs.resolveFile(tabId));
+    if (!key) return;
+    await this.revealFile(key);
   }
 
   async revealFile(rel) {
@@ -268,7 +338,13 @@ export class FilesPanelApp {
 
   start() {
     this.filterBar = h("div", { class: "file-tree-filter-bar", hidden: true });
-    const panel = h("div", { class: "files-panel" }, this.filterBar, h("div", { class: "file-tree-wrap" }));
+    const toolbar = h(
+      "div",
+      { class: "file-tree-toolbar" },
+      toolbar_button("Expand all", [{ d: "M7 6l5 5 5-5" }, { d: "M7 13l5 5 5-5" }], () => void this.expandAll()),
+      toolbar_button("Collapse all", [{ d: "M7 11l5-5 5 5" }, { d: "M7 18l5-5 5 5" }], () => this.collapseAll()),
+    );
+    const panel = h("div", { class: "files-panel" }, toolbar, this.filterBar, h("div", { class: "file-tree-wrap" }));
     this.root.replaceChildren(panel);
     this.wrap = panel.querySelector(".file-tree-wrap");
     this.list = h("div", {
@@ -325,6 +401,7 @@ export class FilesPanelApp {
       this.gitStatus.subscribe(() => this.onGitStatusChange()),
       muxy.events.subscribe("worktree.switched", () => void this.loadRoot()),
       muxy.events.subscribe("project.switched", () => void this.loadRoot()),
+      muxy.events.subscribe("projects.changed", () => void this.refreshFolders()),
       // When our panel is (re)opened, pull keyboard focus into the tree so it's
       // navigable immediately without a click.
       muxy.events.subscribe("panel.opened", (payload) => {
@@ -334,8 +411,11 @@ export class FilesPanelApp {
         void this.revealActiveTab(payload);
       }),
       muxy.events.subscribe("file.changed", (payload) => {
-        this.scheduleReconcile(payload);
-        this.gitStatus.scheduleRefresh(RECONCILE_DEBOUNCE_MS);
+        const root = change_root(payload);
+        const extra = root && this.extraRoots.includes(node_key(root, "")) ? root : null;
+        this.scheduleReconcile(payload, extra);
+        // Git status covers the main folder only.
+        if (!extra) this.gitStatus.scheduleRefresh(RECONCILE_DEBOUNCE_MS);
       }),
       muxy.events.subscribe("command.files-new-file", () => void this.createFile("")),
       muxy.events.subscribe("command.files-new-folder", () => void this.createFolder("")),
@@ -376,8 +456,9 @@ export class FilesPanelApp {
   }
 
   recordChildren(dirRel, entries) {
-    const byRel = new Map(entries.map((entry) => [entry_to_rel(entry), entry]));
-    const rels = sorted_rels(entries);
+    const { root } = split_key(dirRel);
+    const byRel = new Map(entries.map((entry) => [node_key(root, entry_to_rel(entry)), entry]));
+    const rels = sorted_rels(entries).map((rel) => node_key(root, rel));
     const previous = this.children.get(dirRel) ?? [];
     const nextSet = new Set(rels);
     for (const oldPath of previous) {
@@ -413,10 +494,12 @@ export class FilesPanelApp {
     this.children.clear();
     this.loadedDirs.clear();
     this.expandedDirs.clear();
+    this.mainCollapsed = false;
     this.setSelection(null);
     this.closeContextMenu();
     void this.gitStatus.refresh();
     const rootPromise = this.resolveRoot();
+    const foldersPromise = this.loadFolders();
     try {
       const entries = await muxy.files.list("");
       this.recordChildren("", entries);
@@ -430,6 +513,9 @@ export class FilesPanelApp {
         .catch(() => undefined);
       this.children.set("", []);
     }
+    this.extraRoots = [];
+    this.render();
+    this.setExtraRoots(await foldersPromise);
     this.render();
     const [root] = await Promise.all([rootPromise, this.restoreMemory()]);
     this.worktreeRoot = root;
@@ -439,12 +525,50 @@ export class FilesPanelApp {
   }
 
   async revealActiveOnLoad() {
-    const rel = await this.openTabs.activeFilePath();
-    if (rel) await this.revealFile(rel);
+    const key = this.keyForFile(await this.openTabs.activeFile());
+    if (key) await this.revealFile(key);
+  }
+
+  async loadFolders() {
+    try {
+      const projects = await muxy.projects.list();
+      const active = Array.isArray(projects) ? projects.find((project) => project?.isActive) : null;
+      const folders = Array.isArray(active?.folders) ? active.folders : [];
+      return Array.from(new Set(folders.map(normalize_root).filter(Boolean)));
+    } catch {
+      return [];
+    }
+  }
+
+  // Extra folders start collapsed and list nothing until expanded, so large
+  // folders cost nothing up front.
+  setExtraRoots(folders) {
+    const next = folders.map((folder) => node_key(folder, ""));
+    for (const key of this.extraRoots) {
+      if (!next.includes(key)) this.removeSubtree(key);
+    }
+    for (const key of next) {
+      if (!this.entries.has(key)) this.entries.set(key, { path: key, kind: "directory", isIgnored: false });
+    }
+    this.extraRoots = next;
+  }
+
+  async refreshFolders() {
+    const folders = await this.loadFolders();
+    const next = folders.map((folder) => node_key(folder, ""));
+    if (next.length === this.extraRoots.length && next.every((key, i) => key === this.extraRoots[i])) return;
+    this.setExtraRoots(folders);
+    this.render();
+  }
+
+  listDir(dirKey) {
+    const { root, rel } = split_key(dirKey);
+    return muxy.files.list(rel, root_opts(root));
   }
 
   async restoreMemory() {
-    const { expanded, selected } = await load_tree_memory();
+    const { expanded, selected, collapsed } = await load_tree_memory();
+    this.mainCollapsed = collapsed;
     const byDepth = new Map();
     for (const dir of expanded) {
       const depth = depth_of(dir);
@@ -469,12 +593,12 @@ export class FilesPanelApp {
   }
 
   persistMemory() {
-    void save_tree_memory(this.expandedDirs, this.selectedPath);
+    void save_tree_memory(this.expandedDirs, this.selectedPath, this.mainCollapsed);
   }
 
   async loadChildren(dirRel) {
     try {
-      const entries = await muxy.files.list(dirRel);
+      const entries = await this.listDir(dirRel);
       this.recordChildren(dirRel, entries);
     } catch {
       return;
@@ -488,7 +612,7 @@ export class FilesPanelApp {
   async refreshDir(dirRel) {
     if (!this.loadedDirs.has(dirRel)) return;
     try {
-      const entries = await muxy.files.list(dirRel);
+      const entries = await this.listDir(dirRel);
       this.recordChildren(dirRel, entries);
     } catch {
       return;
@@ -533,8 +657,14 @@ export class FilesPanelApp {
     );
   }
 
+  // Extra folders have no git status, so they show no markers and the
+  // changed-files filter hides them.
+  gitStatusFor(path, directory) {
+    return path.startsWith("\0") ? null : this.gitStatus.statusFor(path, directory);
+  }
+
   isVisibleInFilter(path, directory) {
-    return Boolean(this.gitStatus.statusFor(path, directory));
+    return Boolean(this.gitStatusFor(path, directory));
   }
 
   renderFilterBar() {
@@ -582,7 +712,10 @@ export class FilesPanelApp {
     this.rowElements = new Map();
     this.renderOrder = [];
     const rootChildren = this.children.get("") ?? [];
-    if (rootChildren.length === 0) {
+    this.renderOrder.push(this.renderMainRow());
+    if (this.mainCollapsed) {
+      // The project folder's tree is hidden under its root row.
+    } else if (rootChildren.length === 0) {
       this.renderOrder.push(h("div", { class: "files-status" }, "No files"));
     } else if (this.dirtyFilter) {
       const visible = rootChildren.filter((path) => this.isVisibleInFilter(path, is_dir(path)));
@@ -590,10 +723,13 @@ export class FilesPanelApp {
         const message = this.gitStatus.available ? "No changed files" : "No git changes";
         this.renderOrder.push(h("div", { class: "files-status" }, message));
       } else {
-        for (const path of visible) this.renderRow(path, 0);
+        for (const path of visible) this.renderRow(path, 1);
       }
     } else {
-      for (const path of rootChildren) this.renderRow(path, 0);
+      for (const path of rootChildren) this.renderRow(path, 1);
+    }
+    if (!this.dirtyFilter) {
+      for (const key of this.extraRoots) this.renderRow(key, 0);
     }
     // Rows that didn't change keep their DOM node: rebuilding every row broke
     // clicks, since a render landing between mousedown and mouseup destroyed
@@ -605,6 +741,96 @@ export class FilesPanelApp {
     }
     this.renderedSelection = new Set(this.selectedPaths);
     this.syncActiveDescendant();
+  }
+
+  // The project folder's root row. It isn't a tree node, since "" is the
+  // empty selection, so keyboard navigation skips it.
+  renderMainRow() {
+    const name = this.worktreeRoot ? basename(this.worktreeRoot) : "Project";
+    const expanded = !this.mainCollapsed;
+    const signature = [name, expanded ? 1 : 0, this.iconTheme].join("|");
+    if (this.mainRow?.signature === signature) return this.mainRow.element;
+    const toggle = (event) => {
+      event.stopPropagation();
+      this.mainCollapsed = !this.mainCollapsed;
+      this.render();
+      this.persistMemory();
+      this.list?.focus({ preventScroll: true });
+    };
+    const element = h(
+      "div",
+      {
+        class: "file-tree-row file-tree-root-row",
+        role: "treeitem",
+        "aria-expanded": expanded,
+        onClick: toggle,
+        onContextMenu: (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          this.showContextMenu({ kind: "directory", name: "Root", path: "" }, event.clientX, event.clientY);
+        },
+        onDragOver: (event) => {
+          event.preventDefault();
+          this.dropTarget = "";
+        },
+        onDrop: (event) => this.dropPaths(event, ""),
+      },
+      // Matches the indent span every tree row has, so the roots line up.
+      h("span", { class: "file-tree-indent", style: { width: "0px" } }),
+      h(
+        "button",
+        {
+          class: "file-tree-disclosure",
+          type: "button",
+          "aria-label": expanded ? "Collapse folder" : "Expand folder",
+          onClick: toggle,
+        },
+        chevron_icon(expanded),
+      ),
+      h("span", { class: "file-tree-kind-icon" }, file_icon("directory", "", this.iconTheme)),
+      h("span", { class: "file-tree-name", title: this.worktreeRoot ?? "" }, name),
+    );
+    this.mainRow = { element, signature };
+    return element;
+  }
+
+  // Opens every folder, breadth first, skipping ignored ones like
+  // node_modules, up to EXPAND_ALL_LIMIT folders.
+  async expandAll() {
+    if (this.dirtyFilter) return;
+    this.mainCollapsed = false;
+    const queue = ["", ...this.extraRoots];
+    let visited = 0;
+    while (queue.length > 0 && visited < EXPAND_ALL_LIMIT) {
+      const batch = queue.splice(0, Math.min(EXPAND_ALL_BATCH, EXPAND_ALL_LIMIT - visited));
+      visited += batch.length;
+      await Promise.all(
+        batch.map(async (dir) => {
+          if (dir !== "") this.expandedDirs.add(dir);
+          await this.ensureLoaded(dir);
+        }),
+      );
+      for (const dir of batch) {
+        for (const child of this.children.get(dir) ?? []) {
+          if (is_dir(child) && !this.entries.get(child)?.isIgnored) queue.push(child);
+        }
+      }
+    }
+    this.render();
+    this.persistMemory();
+    if (queue.length > 0) {
+      void muxy
+        .toast({ title: "Files", body: `Expanded the first ${EXPAND_ALL_LIMIT} folders`, variant: "info" })
+        .catch(() => undefined);
+    }
+  }
+
+  // Folds every folder, the project's own root included, down to the root rows.
+  collapseAll() {
+    this.mainCollapsed = true;
+    this.expandedDirs.clear();
+    this.render();
+    this.persistMemory();
   }
 
   rowSignature(depth, entry, directory, expanded, renaming, gitStatus) {
@@ -625,7 +851,7 @@ export class FilesPanelApp {
     const directory = entry.kind === "directory";
     const expanded = directory && this.expandedDirs.has(path);
     const renaming = this.renameState?.path === path;
-    const gitStatus = this.gitStatus.statusFor(path, directory);
+    const gitStatus = this.gitStatusFor(path, directory);
     const signature = this.rowSignature(depth, entry, directory, expanded, renaming, gitStatus);
     const cached = this.rowCache.get(path);
     // A row mid-rename is always rebuilt so it re-adopts the live input.
@@ -663,10 +889,11 @@ export class FilesPanelApp {
           entry.isIgnored && "file-tree-row-ignored",
           gitStatus && GIT_STATUS_CLASS[gitStatus],
           gitStatus && directory && "file-tree-row-git-folder",
+          is_root_node(path) && "file-tree-root-row",
         ),
         role: "treeitem",
         "aria-expanded": directory ? expanded : undefined,
-        draggable: !renaming,
+        draggable: !renaming && !is_root_node(path),
         dataset: { path, type: "item", itemType: directory ? "directory" : "file", itemPath: path },
         onClick: (event) => {
           event.stopPropagation();
@@ -699,7 +926,9 @@ export class FilesPanelApp {
         },
         onDragStart: (event) => {
           if (!event.dataTransfer) return;
-          const dragging = this.selectedPaths.has(path) && this.selectedPaths.size > 1 ? this.selectionList() : [path];
+          const dragging = (
+            this.selectedPaths.has(path) && this.selectedPaths.size > 1 ? this.selectionList() : [path]
+          ).filter((key) => !is_root_node(key));
           event.dataTransfer.setData("application/x-muxy-path", dragging.join("\n"));
           const abses = dragging.map((rel) => this.abs_path(rel)).filter(Boolean);
           if (abses.length === dragging.length) {
@@ -740,7 +969,9 @@ export class FilesPanelApp {
           )
         : h("span", { class: "file-tree-disclosure file-tree-disclosure-placeholder" }),
       h("span", { class: "file-tree-kind-icon" }, file_icon(entry.kind, path, this.iconTheme)),
-      renaming ? this.renderRenameInput(path, directory) : h("span", { class: "file-tree-name", title: path }, basename(path)),
+      renaming
+        ? this.renderRenameInput(path, directory)
+        : h("span", { class: "file-tree-name", title: split_key(path).rel || split_key(path).root }, display_name(path)),
       !renaming && !directory && gitStatus
         ? h("span", { class: "file-tree-git-mark", title: GIT_STATUS_LABEL[gitStatus] }, GIT_STATUS_GLYPH[gitStatus])
         : null,
@@ -880,8 +1111,8 @@ export class FilesPanelApp {
     return this.visiblePaths.filter((path) => this.selectedPaths.has(path));
   }
 
-  async copyPaths(rels) {
-    await copy_paths(rels);
+  async copyPaths(keys) {
+    await copy_paths(keys.map(copy_text));
   }
 
   // ---- Keyboard navigation -------------------------------------------------
@@ -1015,13 +1246,13 @@ export class FilesPanelApp {
         void this.activatePath(paths[idx]);
         return;
       case "F2":
-        if (idx < 0 || paths[idx] === "") return;
+        if (idx < 0 || is_root_node(paths[idx])) return;
         event.preventDefault();
         this.startRename(paths[idx]);
         return;
       case "Delete":
       case "Backspace": {
-        const targets = this.selectionList().filter((path) => path !== "");
+        const targets = this.selectionList().filter((path) => !is_root_node(path));
         if (targets.length === 0) return;
         event.preventDefault();
         void this.deletePaths(targets);
@@ -1095,7 +1326,7 @@ export class FilesPanelApp {
     const buffer = this.typeahead.buffer;
     for (let i = 1; i <= paths.length; i += 1) {
       const candidate = paths[(start + i) % paths.length];
-      if (basename(candidate).toLowerCase().startsWith(buffer)) {
+      if (display_name(candidate).toLowerCase().startsWith(buffer)) {
         this.moveSelection(candidate);
         return;
       }
@@ -1104,29 +1335,32 @@ export class FilesPanelApp {
 
   async createFile(parentRel) {
     const parent = canonical_dir(parentRel);
-    const rel = await create_file(parent);
+    const { root, rel: parentPath } = split_key(parent);
+    const rel = await create_file(parentPath, root);
     if (!rel) return false;
     this.expandedDirs.add(parent);
     await this.ensureLoaded(parent);
     await this.refreshDir(parent);
-    this.startRename(rel, { removeIfCanceled: true });
+    this.startRename(node_key(root, rel), { removeIfCanceled: true });
     return true;
   }
 
   async createFolder(parentRel) {
     const parent = canonical_dir(parentRel);
-    const rel = await create_folder(parent);
+    const { root, rel: parentPath } = split_key(parent);
+    const rel = await create_folder(parentPath, root);
     if (!rel) return false;
     this.expandedDirs.add(parent);
     await this.ensureLoaded(parent);
     await this.refreshDir(parent);
-    this.startRename(rel, { removeIfCanceled: true });
+    this.startRename(node_key(root, rel), { removeIfCanceled: true });
     return true;
   }
 
-  async deletePaths(rels) {
+  async deletePaths(keys) {
+    const rels = keys.filter((key) => !is_root_node(key));
     const parents = new Set(rels.map((rel) => parent_dir(rel)));
-    const ok = await delete_paths(rels);
+    const ok = await delete_paths(rels.map(split_key));
     if (!ok) return false;
     for (const rel of rels) this.removeSubtree(rel);
     await Promise.all(Array.from(parents, (parent) => this.refreshDir(parent)));
@@ -1134,9 +1368,11 @@ export class FilesPanelApp {
     return true;
   }
 
-  async duplicate(rel) {
-    const dest = await duplicate_op(rel);
-    if (!dest) return false;
+  async duplicate(key) {
+    const { root, rel } = split_key(key);
+    const destRel = await duplicate_op(rel, root);
+    if (!destRel) return false;
+    const dest = node_key(root, destRel);
     await this.refreshDir(parent_dir(dest));
     this.setSelection(dest);
     this.render();
@@ -1144,7 +1380,7 @@ export class FilesPanelApp {
   }
 
   startRename(path, options = {}) {
-    if (!this.entries.has(path)) return;
+    if (!this.entries.has(path) || is_root_node(path)) return;
     this.activeRenameInput = null;
     this.renameState = { path, removeIfCanceled: Boolean(options.removeIfCanceled), committing: false };
     this.setSelection(path);
@@ -1163,7 +1399,8 @@ export class FilesPanelApp {
     }
     state.committing = true;
     const dest = path_after_rename(path, newName, directory);
-    const ok = await rename_fs(path, dest, directory);
+    const { root } = split_key(path);
+    const ok = await rename_fs(split_key(path).rel, split_key(dest).rel, directory, root);
     this.renameState = null;
     this.activeRenameInput = null;
     if (ok) {
@@ -1180,28 +1417,22 @@ export class FilesPanelApp {
     this.renameState = null;
     this.activeRenameInput = null;
     if (state.removeIfCanceled) {
-      await muxy.files.delete([state.path]).catch(() => undefined);
+      const { root, rel } = split_key(state.path);
+      await muxy.files.delete([rel], root_opts(root)).catch(() => undefined);
       await this.refreshDir(parent_dir(state.path));
     }
     this.render();
   }
 
   async resolveRoot() {
-    // muxy.exec defaults its cwd to the active worktree root — the same root
-    // muxy.files paths are relative to — so `pwd` yields the absolute base
-    // without needing the worktrees:read permission.
-    try {
-      const res = await muxy.exec(["pwd"]);
-      if (res?.exitCode === 0) return res.stdout.trim() || null;
-    } catch {
-      /* fall through */
-    }
-    return null;
+    return (await worktree_root()) ?? null;
   }
 
-  abs_path(rel) {
-    if (!this.worktreeRoot) return null;
-    return `${this.worktreeRoot.replace(/\/+$/, "")}/${strip_slash(rel)}`;
+  abs_path(key) {
+    const { root, rel } = split_key(key);
+    const base = root ?? this.worktreeRoot;
+    if (!base) return null;
+    return `${base.replace(/\/+$/, "")}/${strip_slash(rel)}`;
   }
 
   file_url(abs) {
@@ -1215,17 +1446,27 @@ export class FilesPanelApp {
     this.dropTarget = null;
     if (!raw) return;
     const target = canonical_dir(targetDirRel);
-    const dragged = raw
+    const targetRoot = split_key(target).root;
+    const keys = raw
       .split("\n")
       .map((path) => path.trim())
-      .filter(Boolean)
+      .filter(Boolean);
+    // muxy.files.move works within one folder only.
+    if (keys.some((path) => split_key(path).root !== targetRoot)) {
+      void muxy
+        .toast({ title: "Move", body: "Items can only be moved within the same folder", variant: "info" })
+        .catch(() => undefined);
+      this.render();
+      return;
+    }
+    const dragged = keys
       .filter((path) => path !== target && parent_dir(path) !== target && !(path.endsWith("/") && target.startsWith(path)));
     if (dragged.length === 0) {
       this.render();
       return;
     }
     const sourceParents = new Set(dragged.map((path) => parent_dir(path)));
-    const ok = await move_fs(dragged, target);
+    const ok = await move_fs(dragged.map((path) => split_key(path).rel), split_key(target).rel, targetRoot);
     if (ok) {
       for (const path of dragged) this.removeSubtree(path);
       await Promise.all(Array.from(sourceParents, (parent) => this.refreshDir(parent)));
@@ -1251,10 +1492,24 @@ export class FilesPanelApp {
     return best;
   }
 
-  scheduleReconcile(payload) {
+  // Extra-folder changes map exactly onto their folder's keys; main-folder
+  // changes keep the suffix match against loaded dirs.
+  resolveLoadedExtraDir(root, rawPath) {
+    const abs = strip_slash(rawPath);
+    // A rescan reports the folder itself.
+    if (abs === root) return this.loadedDirs.has(node_key(root, "")) ? node_key(root, "") : null;
+    if (!abs.startsWith(`${root}/`)) return null;
+    let dir = parent_dir(node_key(root, abs.slice(root.length + 1)));
+    while (dir !== "" && !this.loadedDirs.has(dir)) dir = parent_dir(dir);
+    return dir === "" ? null : dir;
+  }
+
+  scheduleReconcile(payload, root = null) {
     const raw = payload && typeof payload === "object" && "path" in payload ? payload.path : undefined;
     if (typeof raw !== "string" || raw.trim() === "") return;
-    this.pendingDirs.add(this.resolveLoadedDir(raw));
+    const dir = root ? this.resolveLoadedExtraDir(root, raw) : this.resolveLoadedDir(raw);
+    if (dir === null) return;
+    this.pendingDirs.add(dir);
     if (this.reconcileTimer !== null) return;
     this.reconcileTimer = setTimeout(() => {
       this.reconcileTimer = null;

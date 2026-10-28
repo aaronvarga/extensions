@@ -1,6 +1,6 @@
 import pdfWorkerUrl from "pdfjs-dist/build/pdf.worker.min.mjs?url";
 import { read_binary_bytes } from "@/lib/binary-data";
-import { error_message } from "@/lib/files";
+import { error_message, root_opts } from "@/lib/files";
 import { format_file_size } from "@/lib/file-size";
 import { cls, h, icon_svg } from "@/lib/dom";
 
@@ -47,9 +47,10 @@ function ZoomInIcon() {
 }
 
 export class PdfViewer {
-  constructor({ parent, filePath }) {
+  constructor({ parent, filePath, root = null }) {
     this.parent = parent;
     this.filePath = filePath;
+    this.fileRoot = root;
     this.pdf = null;
     this.pdfjs = null;
     this.loadingTask = null;
@@ -104,7 +105,7 @@ export class PdfViewer {
   async load() {
     try {
       const [data, pdfjs] = await Promise.all([
-        read_binary_bytes(this.filePath, "PDF"),
+        read_binary_bytes(this.filePath, "PDF", this.fileRoot),
         load_pdfjs(),
       ]);
       if (this.disposed) return;
@@ -268,7 +269,7 @@ export class PdfViewer {
 
   async addFileSize(slot) {
     try {
-      const stat = await muxy.files.stat(this.filePath);
+      const stat = await muxy.files.stat(this.filePath, root_opts(this.fileRoot));
       if (this.disposed) return;
       const label = format_file_size(stat?.size);
       if (label) slot.textContent = label;
